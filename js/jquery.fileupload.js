@@ -160,6 +160,8 @@
             // By default, uploads are started automatically when adding files:
             autoUpload: true,
 
+            processFile: undefined,
+
             // Error and info messages:
             messages: {
                 uploadedBytes: 'Uploaded bytes exceed file size'
@@ -705,6 +707,37 @@
                     parseInt(parts[1], 10);
             return upperBytesPos && upperBytesPos + 1;
         },
+        
+        _ajaxUpload: function(options) {
+          var dfd = $.Deferred(),
+              promise = dfd.promise(),
+              that = this,
+              file = options.files[0],
+              ub = options.uploadedBytes,
+              mcs = options.maxChunkSize,
+              fs = file.size,
+              cs;
+          cs = Math.min(fs, ub+mcs);
+
+          if (options.processFile) {
+            this._enhancePromise(promise);
+            promise.abort = function () {
+                return jqXHR.abort();
+            };
+            options.processFile(file, ub, ub+cs).done(function(blob){
+              options.blob = blob;
+              that._initXHRData(options);
+              $.ajax(options).done(function (result, textStatus, jqXHR) {
+                dfd.resolveWith(
+                    options.context,
+                    [result, textStatus, jqXHR]
+                );
+              });
+            });
+            return promise;
+          }
+          return $.ajax(options)
+        },
 
         // Uploads a file in multiple, sequential requests
         // by splitting the file up in multiple blob chunks.
@@ -717,12 +750,14 @@
                 file = options.files[0],
                 fs = file.size,
                 ub = options.uploadedBytes,
+                offset = options.uploadedBytes,
                 mcs = options.maxChunkSize || fs,
                 slice = this._blobSlice,
                 dfd = $.Deferred(),
                 promise = dfd.promise(),
                 jqXHR,
-                upload;
+                upload,
+                getChunkAndUpload;
             if (!(this._isXHRUpload(options) && slice && (ub || mcs < fs)) ||
                     options.data) {
                 return false;
@@ -739,69 +774,85 @@
                 );
             }
             // The chunk upload method:
-            upload = function () {
+            getChunkAndUpload = function () {
                 // Clone the options object for each chunk upload:
                 var o = $.extend({}, options),
                     currentLoaded = o._progress.loaded;
-                o.blob = slice.call(
-                    file,
-                    ub,
-                    ub + mcs,
-                    file.type
-                );
-                // Store the current chunk size, as the blob itself
-                // will be dereferenced after data processing:
-                o.chunkSize = o.blob.size;
-                // Expose the chunk bytes position range:
-                o.contentRange = 'bytes ' + ub + '-' +
-                    (ub + o.chunkSize - 1) + '/' + fs;
-                // Process the upload data (the blob and potential form data):
-                that._initXHRData(o);
-                // Add progress listeners for this chunk upload:
-                that._initProgressListener(o);
-                jqXHR = ((that._trigger('chunksend', null, o) !== false && $.ajax(o)) ||
-                        that._getXHRPromise(false, o.context))
-                    .done(function (result, textStatus, jqXHR) {
-                        ub = that._getUploadedBytes(jqXHR) ||
-                            (ub + o.chunkSize);
-                        // Create a progress event if no final progress event
-                        // with loaded equaling total has been triggered
-                        // for this chunk:
-                        if (currentLoaded + o.chunkSize - o._progress.loaded) {
-                            that._onProgress($.Event('progress', {
-                                lengthComputable: true,
-                                loaded: ub - o.uploadedBytes,
-                                total: ub - o.uploadedBytes
-                            }), o);
-                        }
-                        options.uploadedBytes = o.uploadedBytes = ub;
-                        o.result = result;
-                        o.textStatus = textStatus;
-                        o.jqXHR = jqXHR;
-                        that._trigger('chunkdone', null, o);
-                        that._trigger('chunkalways', null, o);
-                        if (ub < fs) {
+                if (options.processFile) {
+                  var dfd = options.processFile(file, ub, mcs);
+                  dfd.done(function(blob) {
+                    o.blob = slice.call(
+                        blob,
+                        0,
+                        mcs,
+                        blob.type
+                    );
+                    upload();
+                  });
+                } else {
+                  o.blob = slice.call(
+                      file,
+                      offset,
+                      offset + mcs,
+                      file.type
+                  );
+                  upload();
+                }
+                upload = function() {
+                  // Store the current chunk size, as the blob itself
+                  // will be dereferenced after data processing:
+                  o.chunkSize = o.blob.size;
+                  // Expose the chunk bytes position range:
+                  o.contentRange = 'bytes ' + ub + '-' +
+                      (ub + o.chunkSize - 1) + '/' + fs;
+                  // Process the upload data (the blob and potential form data):
+                  that._initXHRData(o);
+                  // Add progress listeners for this chunk upload:
+                  that._initProgressListener(o);
+                  jqXHR = ((that._trigger('chunksend', null, o) !== false && $.ajax(o)) ||
+                          that._getXHRPromise(false, o.context))
+                      .done(function (result, textStatus, jqXHR) {
+                          ub = that._getUploadedBytes(jqXHR) ||
+                              (ub + o.chunkSize);
+                          // Create a progress event if no final progress event
+                          // with loaded equaling total has been triggered
+                          // for this chunk:
+                          if (currentLoaded + o.chunkSize - o._progress.loaded) {
+                              that._onProgress($.Event('progress', {
+                                  lengthComputable: true,
+                                  loaded: ub - o.uploadedBytes,
+                                  total: ub - o.uploadedBytes
+                              }), o);
+                          }
+                          options.uploadedBytes = o.uploadedBytes = ub;
+                          o.result = result;
+                          o.textStatus = textStatus;
+                          o.jqXHR = jqXHR;
+                          that._trigger('chunkdone', null, o);
+                          that._trigger('chunkalways', null, o);
+                          if (ub < fs) {
                             // File upload not yet complete,
                             // continue with the next chunk:
-                            upload();
-                        } else {
+                            getChunkAndUpload();
+                          } else {
                             dfd.resolveWith(
                                 o.context,
                                 [result, textStatus, jqXHR]
                             );
-                        }
-                    })
-                    .fail(function (jqXHR, textStatus, errorThrown) {
-                        o.jqXHR = jqXHR;
-                        o.textStatus = textStatus;
-                        o.errorThrown = errorThrown;
-                        that._trigger('chunkfail', null, o);
-                        that._trigger('chunkalways', null, o);
-                        dfd.rejectWith(
-                            o.context,
-                            [jqXHR, textStatus, errorThrown]
-                        );
-                    });
+                          }
+                      })
+                      .fail(function (jqXHR, textStatus, errorThrown) {
+                          o.jqXHR = jqXHR;
+                          o.textStatus = textStatus;
+                          o.errorThrown = errorThrown;
+                          that._trigger('chunkfail', null, o);
+                          that._trigger('chunkalways', null, o);
+                          dfd.rejectWith(
+                              o.context,
+                              [jqXHR, textStatus, errorThrown]
+                          );
+                      });
+                  }
             };
             this._enhancePromise(promise);
             promise.abort = function () {
@@ -896,7 +947,7 @@
                             options
                         ) === false) &&
                         that._getXHRPromise(false, options.context, aborted)) ||
-                        that._chunkedUpload(options) || $.ajax(options)
+                        that._chunkedUpload(options) || that._ajaxUpload(options)
                     ).done(function (result, textStatus, jqXHR) {
                         that._onDone(result, textStatus, jqXHR, options);
                     }).fail(function (jqXHR, textStatus, errorThrown) {
